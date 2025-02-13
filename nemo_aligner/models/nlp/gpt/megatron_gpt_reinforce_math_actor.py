@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+import itertools
 
 import torch
 import torch.distributed
@@ -31,7 +32,9 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 )
 from nemo.collections.nlp.parts.mixins.nlp_adapter_mixins import NLPAdapterModelMixin
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
+from nemo.collections.llm.gpt.model.base import get_packed_seq_params
 from nemo.utils import logging
+
 from nemo_aligner.models.alignable_interface import AlignableGenerativeInterface
 from nemo_aligner.utils import parallel_state
 from nemo_aligner.utils.distributed import (
@@ -102,24 +105,66 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
     # training calls
     def get_actor_forward_output_and_loss_func(self):
         def fwd_output_and_loss_func(data_iterator, model):
-            batch = next(data_iterator)
+            _batch = next(data_iterator)
+
+            torch.distributed.breakpoint()
+
             required_keys = set()
-            if parallel_state.get_pipeline_model_parallel_world_size() == 1:
-                required_keys.update(batch.keys())
+            if parallel_state.is_pipeline_first_stage():
+                required_keys.add("response_tokens")
+            if parallel_state.is_pipeline_last_stage():
+                required_keys.update(("response_tokens", "baseline", "mask", "is_end", "init_policy_kl", "init_log_probs", "rewards", "prompt_mask", "log_probs"))
+
+            batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in _batch.items()}
+                
+            # input_ids =batch['response_tokens']
+            # packed_seq_params = None
+
+
+            # import megatron.core
+            # megatron.core.models.gpt.gpt_model.debug_flag = True
+
+
+            # parallel_logits = model(
+            #     input_ids=input_ids, 
+            #     position_ids=None, 
+            #     attention_mask=None, 
+            #     packed_seq_params=None,
+            #     labels=None,
+            # )
+            packing = True
+            if packing:
+                cu_seqlens = [0]
+                for resp_length in _batch["response_lengths"]:
+                    cu_seqlens.append(cu_seqlens[-1] + resp_length)
+                
+                _batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int, device=torch.cuda.current_device())
+                _batch["cu_seqlens_argmin"] = torch.tensor(len(_batch["response_lengths"])+1, dtype=torch.int)
+                _batch["max_seqlen"] = torch.tensor(max(_batch["response_lengths"]), dtype=torch.int)
+
+                packed_seq_params = get_packed_seq_params(_batch)
+                response_tokens = torch.cat([seq[:length] for seq, length in zip(_batch["response_tokens"], _batch["response_lengths"])])
+                input_ids = torch.unsqueeze(response_tokens, dim=0)
             else:
-                required_keys.add("attention_mask")
-
-                if parallel_state.is_pipeline_first_stage():
-                    required_keys.update(("response_tokens", "position_ids"))
-
-                if parallel_state.is_pipeline_last_stage():
-                    required_keys.update(("response_tokens", "baseline", "mask", "is_end", "init_policy_kl", "init_log_probs", "rewards", "prompt_mask", "log_probs"))
-
-            batch = {key: val.cuda(non_blocking=True) if key in required_keys else None for key, val in batch.items()}
+                packed_seq_params = None
+                input_ids = _batch["response_lengths"]
 
             parallel_logits = model(
-                batch["response_tokens"], batch["position_ids"], batch["attention_mask"], labels=None,
+                input_ids=input_ids, 
+                position_ids=None, 
+                attention_mask=None, 
+                packed_seq_params=packed_seq_params,
+                labels=None,
             )
+
+            if packing:
+                parallel_logits = torch.split(parallel_logits.squeeze(), tuple(_batch["response_lengths"]), dim=0)
+                parallel_logits = torch.nn.utils.rnn.pad_sequence(parallel_logits, batch_first=True)
+                #pad back to the global max seqlen in the batch, #TODO add packed seqlen loss
+                seq_dim = 1
+                global_seqlen = _batch["response_tokens"].shape[seq_dim]
+                pad_amount = global_seqlen - parallel_logits.shape[seq_dim]
+                parallel_logits = torch.nn.functional.pad(parallel_logits, pad=(0, 0, pad_amount, 0))
 
             def loss_func(parallel_logits):
                 mask = batch["mask"]
@@ -196,13 +241,21 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
         prepare_for_training_step(self, zero_grad=False)
 
     def get_loss_and_metrics(self, batch, forward_only):
-        sequence_length = batch["response_tokens"].size(1)
+        packing = True
+        if not packing:
+            sequence_length = batch["response_tokens"].size(1)
 
-        attention_mask, _, position_ids = self.get_ltor_masks_and_position_ids(tokens=batch["response_tokens"])
-        batch["attention_mask"] = attention_mask
-        batch["position_ids"] = position_ids
+            attention_mask, _, position_ids = self.get_ltor_masks_and_position_ids(tokens=batch["response_tokens"])
+            batch["attention_mask"] = attention_mask
+            batch["position_ids"] = position_ids
 
-        data_iter = get_iterator_k_split(batch, get_num_microbatches())
+            data_iter = get_iterator_k_split(batch, get_num_microbatches())
+            num_microbatches = get_num_microbatches()
+        else:
+            num_microbatches = len(batch)
+            data_iter = iter(batch)
+
+            
         set_sync_funcs(self, forward_only)
         fwd_bwd_function = get_forward_backward_func()
 
@@ -210,9 +263,9 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
             forward_step_func=self.get_actor_forward_output_and_loss_func(),
             data_iterator=self._make_data_iterator_list(data_iter),
             model=self.model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=num_microbatches,
             forward_only=forward_only,
-            seq_length=sequence_length,
+            seq_length=None,
             micro_batch_size=self.cfg.micro_batch_size,
         )
 
@@ -239,19 +292,96 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
         """no need to offload adam states here
         """
 
+
+    def pack_and_split_batch(self, batch, tokens_per_mbs_per_gpu=4096):
+        total_tokens_per_mbs = tokens_per_mbs_per_gpu * parallel_state.get_context_parallel_world_size()
+        
+        mbs_bins = [[0, []]]
+
+        response_lengths = batch['response_lengths']
+        if torch.is_tensor(response_lengths):
+            response_lengths = response_lengths.tolist()
+
+        for idx, resp_len in enumerate(response_lengths):
+            mbs_bins = sorted(mbs_bins, key=lambda x: x[0])
+            if mbs_bins[0][0] != 0 and (mbs_bins[0][0] + resp_len > total_tokens_per_mbs):
+                mbs_bins.insert(0, [0, []])
+            
+            mbs_bins[0][0] += resp_len
+            mbs_bins[0][1].append(idx)
+
+        # split and pack the batch into microbatches
+        microbatches = []
+        for total_tokens, indices in mbs_bins:
+            mbs = {}
+            # split the batch into an microbatch
+            for k, v in batch.items():
+                if torch.is_tensor(v):
+                    indices = torch.tensor(indices, dtype=torch.int, device=torch.cuda.current_device())
+                    mbs[k] = torch.index_select(v, dim=0, index=indices).clone()
+                elif v is None:
+                    mbs[k] = None
+                else:
+                    mbs[k] = [v[i] for i in indices]
+
+            # pack the response tokens along the sequence dim
+            # remove the extra padding
+            max_resp_len = max(mbs["response_lengths"])
+            unpacked_response_tokens = mbs["response_tokens"][...,:max_resp_len].clone()
+            mbs['unpacked_response_tokens'] = unpacked_response_tokens
+
+            packed_responses = torch.cat([seq[:length] for seq, length in zip(unpacked_response_tokens, batch["response_lengths"])])
+            packed_responses = torch.unsqueeze(packed_responses, dim=0)
+            mbs['response_tokens'] = packed_responses
+
+            #create packed seq params
+            cu_seqlens = [0]
+            for resp_length in response_lengths:
+                cu_seqlens.append(cu_seqlens[-1] + resp_length)
+
+            mbs['cu_seqlens'] = torch.tensor(cu_seqlens, dtype=torch.int, device=torch.cuda.current_device())
+            mbs['cu_seqlens_argmin'] = torch.tensor(len(response_lengths)+1, dtype=torch.int)
+            mbs['max_seqlen'] = torch.tensor(max(response_lengths), dtype=torch.int)
+
+            microbatches.append(mbs)
+
+        num_microbatches = len(microbatches)
+        microbatches = itertools.chain(microbatches)
+        # divide the thd batch along sequence dim for CP #TODO
+        if parallel_state.get_context_parallel_world_size() > 1:
+            pass
+        
+        return microbatches, num_microbatches
+    
+
     # inference calls
     def get_logprob_output_only_func(self, inference_only=True):
-        fwd_output_only_func = self.get_forward_output_only_func()
-
         def log_prob_output_only_func(dataloader_iter, model):
-            batch = next(dataloader_iter)
 
-            output_tensor, _ = fwd_output_only_func(iter([batch,]), model)
+            batch = next(dataloader_iter)
+            if 'cu_seqlens' in batch:
+                packed_seq_params = get_packed_seq_params(batch)
+
+            output_tensor = model(
+                input_ids=batch['response_tokens'], 
+                position_ids=None, 
+                attention_mask=None, 
+                packed_seq_params=packed_seq_params,
+                labels=None,
+            )
+
+            #unpack the outputs
+            if 'cu_seqlens' in batch:
+                output_tensor = torch.split(output_tensor.squeeze(), tuple(batch["response_lengths"]), dim=0)
+                output_tensor = torch.nn.utils.rnn.pad_sequence(output_tensor, batch_first=True)
+                response_tokens = batch['unpacked_response_tokens']
+            else:
+                response_tokens = batch['response_tokens']
 
             def id_func(output_tensor, non_loss_data=True):
                 logprobs = from_parallel_logits_to_logprobs(
                     vocab_parallel_logits=output_tensor,
-                    target=batch[0],
+                    target=response_tokens,
                     inference_only=inference_only,
                     higher_stability=True,
                 )
@@ -262,17 +392,47 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
         return log_prob_output_only_func
 
     @torch.no_grad()
-    def get_inference_log_probs(self, response_tokens, forward_micro_batch_size=None):
+    def get_inference_log_probs(self, response_tokens, response_lengths=None, forward_micro_batch_size=None):
         if forward_micro_batch_size is None:
             forward_micro_batch_size = self.forward_micro_batch_size
 
         set_sync_funcs(self, forward_only=True)
 
-        mbs, seq_length = response_tokens.size()
-        num_microbatches = divide(mbs, forward_micro_batch_size)
         attention_mask, _, position_ids = self.get_ltor_masks_and_position_ids(response_tokens)
 
-        batch_iter = get_iterator_k_split([response_tokens, attention_mask, position_ids], num_microbatches)
+        _batch = {
+            "response_tokens" : response_tokens,
+            "response_lengths" : response_lengths, 
+        }
+
+        #divide batch into microbatches
+        self.sequence_packing = True
+        if self.sequence_packing:
+            assert response_lengths is not None
+
+            _batch.update(
+                    {
+                        "attention_mask" : None,
+                        "position_ids" : None,
+                    }
+                )
+
+            batch_iter, num_microbatches = self.pack_and_split_batch(
+                _batch, 
+                tokens_per_mbs_per_gpu=4096
+            ) 
+
+        else:
+            mbs, seq_length = response_tokens.size()
+            num_microbatches = divide(mbs, forward_micro_batch_size)
+
+            _batch.update(
+                {
+                    "attention_mask" : attention_mask,
+                    "position_ids" : position_ids,
+                }
+            )
+            batch_iter = get_iterator_k_split(_batch, num_microbatches)
 
         fwd_bwd_function = get_forward_backward_func()
         logprobs_list = fwd_bwd_function(
@@ -281,11 +441,10 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
             model=self.model,
             num_microbatches=num_microbatches,
             forward_only=True,
-            seq_length=seq_length,
-            micro_batch_size=forward_micro_batch_size,
+            seq_length=None, # unused
+            micro_batch_size=None, # unused
             collect_non_loss_data=True,
         )
-
         logprobs = torch.cat(logprobs_list) if len(logprobs_list) > 0 else None
 
         # Broadcast it from last PP stage to everything else.
@@ -364,13 +523,13 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
             for i in range(response_lengths.shape[0])
         ]
 
-        print(
-            [
-                response_tokens[i][response_lengths[i] - 2 : response_lengths[i]].tolist()
-                for i in range(response_lengths.shape[0])
-            ]
-        )  # print last 2 tokens from each seq
-        # print(response_sentences)
+        # print(
+        #     [
+        #         response_tokens[i][response_lengths[i] - 2 : response_lengths[i]].tolist()
+        #         for i in range(response_lengths.shape[0])
+        #     ]
+        # )  # print last 2 tokens from each seq
+        # print(f"response_lengths {response_lengths}")
         rollout_batch = {
             "response_tokens": response_tokens,
             "response_lengths": response_lengths,
@@ -384,7 +543,7 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
 
         return rollout_batch
 
-    def get_init_policy_logprobs(self, response_tokens):
+    def get_init_policy_logprobs(self, response_tokens, response_lengths=None):
         use_peft_init_policy = self.use_peft and self.init_policy_state_dict is None
 
         context_mgr = (
@@ -394,7 +553,9 @@ class MegatronGPTReinforceActorModel(NLPAdapterModelMixin, MegatronGPTModel, Ali
         )
 
         with context_mgr:
-            return self.get_inference_log_probs(response_tokens)
+            out = self.get_inference_log_probs(response_tokens, response_lengths)
+            print(f"{torch.cuda.current_device()} fflag2!")
+            return out
 
     def finish_inference(self):
         # training will onload the adam states, no need to onload it here

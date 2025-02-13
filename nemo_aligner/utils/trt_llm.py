@@ -15,6 +15,7 @@ import secrets
 import tensorrt_llm
 import torch
 import torch.distributed
+import time
 
 from nemo.export.tensorrt_llm import TensorRTLLM
 from nemo.export.trt_llm import tensorrt_llm_run
@@ -68,6 +69,8 @@ class GPTGenerateTRTLLM:
         reshard_model=False,
         trt_model_dir="/tmp/trt_llm_model",
     ):
+        trt_model_dir = '/lustre/fsw/coreai_dlalgo_llm/jiemingz/rlhf/tmp/trt_llm_model'
+
         if not HAVE_TRTLLM:
             raise RuntimeError(
                 "You are trying to use NeMo-Aligner's TensorRT-LLM acceleration for LLM generation. Please build the dockerfile to enable this feature: https://github.com/NVIDIA/NeMo-Aligner/blob/main/Dockerfile"
@@ -151,7 +154,7 @@ class GPTGenerateTRTLLM:
 
     def refit(self, model):
         if not self._trtllm_model_compiled:
-            log_memory("Before TRT-LLM engine build")
+            log_memory(f"Before TRT-LLM engine build, self.max_input_len {self.max_input_len} self.max_generation_length {self.max_generation_length} self.generation_batch_size {self.generation_batch_size}")
             global_devices = [None for _ in range(torch.distributed.get_world_size())]
             torch.distributed.all_gather_object(global_devices, torch.cuda.current_device())
             gpus_per_node = max(global_devices) + 1
@@ -173,7 +176,7 @@ class GPTGenerateTRTLLM:
         else:
             log_memory("Before TRT-LLM engine refit")
             self.trt_llm_exporter.refit(model, self.model_cfg)
-            log_memory("After TRT-LLM engine refit")
+            log_memory("After TRT-LLM engine refit")        
 
     def _generate(self, inputs: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -229,3 +232,5 @@ class GPTGenerateTRTLLM:
         self.trt_llm_exporter.unload_engine()
         clear_memory()
         log_memory("After TRT-LLM engine unload")
+        toc = time.perf_counter()
+        print(f"engine offload took {toc-tic}")

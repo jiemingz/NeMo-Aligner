@@ -908,13 +908,13 @@ class MathDataset(RewardModelDataset):
         while True:
             sample = self.data[idx]
             problem = sample["problem"]
-            if self.apply_chat:
-                prompt = self.prompt + problem
-                if self.cfg.data.get("prompt_file", None) is not None:
-                    prompt = prompt + "\nLet's think step by step\n"
+            # if self.apply_chat:
+            #     prompt = self.prompt + problem
+            #     if self.cfg.data.get("prompt_file", None) is not None:
+            #         prompt = prompt + "\nLet's think step by step\n"
 
-                chat = [{"role": "user", "content": prompt}]
-                problem = self.tokenizer.apply_chat_template(chat, tokenize=False)
+            #     chat = [{"role": "user", "content": prompt}]
+            #     problem = self.tokenizer.apply_chat_template(chat, tokenize=False)
                 # print(problem)
             sample_text, sample_length = self.encode(problem)
             sample_label = str(sample["expected_answer"])

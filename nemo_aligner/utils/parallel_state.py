@@ -61,27 +61,40 @@ def get_model_parallel_group():
 def get_data_parallel_world_size():
     data_parallel_size = mcore_parallel_state.get_data_parallel_world_size()
 
-    return (
-        data_parallel_size * mcore_parallel_state.get_pipeline_model_parallel_world_size()
-        if is_trt_llm_reshard()
-        else data_parallel_size
-    )
+    if is_trt_llm_reshard():
+        return data_parallel_size * mcore_parallel_state.get_pipeline_model_parallel_world_size() * mcore_parallel_state.get_context_parallel_world_size()
+    else:
+        return data_parallel_size
+
 
 
 def get_data_parallel_rank():
     data_parallel_rank = mcore_parallel_state.get_data_parallel_rank()
 
     if is_trt_llm_reshard():
-        data_parallel_rank = data_parallel_rank + (
-            mcore_parallel_state.get_data_parallel_world_size()
-            * mcore_parallel_state.get_pipeline_model_parallel_rank()
-        )
+        cp_rank = mcore_parallel_state.get_context_parallel_rank()
+        pp_rank = mcore_parallel_state.get_pipeline_model_parallel_rank()
+        
+        cp_size = mcore_parallel_state.get_context_parallel_world_size()
+        dp_size = mcore_parallel_state.get_data_parallel_world_size()
+        pp_size = mcore_parallel_state.get_pipeline_model_parallel_world_size()
+
+        #unfold PP
+        data_parallel_rank = data_parallel_rank + (dp_size * pp_rank)
+
+        #unfold CP
+        data_parallel_rank = data_parallel_rank + (dp_size * pp_size * cp_rank)
+
 
     return data_parallel_rank
 
 
 def get_pipeline_model_parallel_world_size():
     return 1 if is_trt_llm_reshard() else mcore_parallel_state.get_pipeline_model_parallel_world_size()
+
+
+def get_context_model_parallel_world_size():
+    return 1 if is_trt_llm_reshard() else mcore_parallel_state.get_context_parallel_world_size()
 
 
 @contextmanager

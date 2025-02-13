@@ -38,6 +38,38 @@ def triton_textencode(text_batch: List[str]):
     return enc
 
 
+from nemo_skills.code_execution import math_grader
+from nemo_skills.math_grader_server import SimpleMathGrader, extract_and_check
+
+class GraderClient:
+    def infer_rm(self, rollout_batch):
+        def to_str_list(np_bytes):
+            np_bytes = np.array([i[0] for i in np_bytes])
+            return [str(i) for i in np.char.decode(np_bytes.astype("bytes"), "utf-8")]
+
+
+        # response_tokens = rollout_batch["response_tokens"].cpu()
+        response_sentences = rollout_batch["response_sentences"]
+        ground_truths = rollout_batch["ground_truths"]
+        # og_seq_length = response_tokens.size(-1)
+
+        # inputs = {'pred_responses': response_sentences, 'ground_truth' : ground_truths}
+        # inputs['pred_responses'] = to_str_list(inputs['pred_responses'])
+        # inputs['ground_truth'] = to_str_list(inputs['ground_truth'])
+        # predictions, ground_truth = inputs['pred_responses'], inputs['ground_truth']
+
+        rewards = np.zeros(len(response_sentences))
+
+        # rewards = np.zeros(len(ground_truth))
+        # for idx in range(len(ground_truth)):
+        #     rewards[idx] =  extract_and_check(predictions[idx], ground_truth[idx])
+        
+        rewards = rewards.reshape((rewards.shape[0], 1))
+        rewards = torch.from_numpy(rewards).cuda().squeeze()
+        output_dict = {"rewards": rewards}
+        return output_dict
+
+
 @dataclass
 class RemoteGraderClient:
     cfg: DictConfig

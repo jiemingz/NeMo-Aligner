@@ -20,7 +20,7 @@ import os
 from collections import UserDict, defaultdict
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Union
-
+import time
 import pandas as pd
 import torch
 from megatron.core import parallel_state as mcore_parallel_state
@@ -40,7 +40,7 @@ from nemo_aligner.utils.distributed import (
     gather_string_list_nccl,
     masked_global_mean_var,
     normalize_tensor,
-    rebalance_nd_tensor,
+    rebalance_pad_2d_tensor,
 )
 from nemo_aligner.utils.parallel_state import is_trt_llm_reshard, trt_llm_reshard_region
 from nemo_aligner.utils.ppo_utils import (
@@ -104,6 +104,7 @@ class ReinforceRolloutBatch(UserDict):
         """
         global_rollout_batch = type(self)()
 
+        #TODO are k,v always in the same order?
         for k, val in self.data.items():
             if isinstance(val, torch.Tensor):
                 # with reshard enabled, PP groups turn into DP groups. So need to balance them first and then
@@ -111,13 +112,15 @@ class ReinforceRolloutBatch(UserDict):
                 # NOTE: this logic needs to use the pure parallel state, that is one without sharding but needs
                 # to ping the is_trt_llm_reshard variable
                 if is_trt_llm_reshard():
-                    val = rebalance_nd_tensor(val, group=mcore_parallel_state.get_pipeline_model_parallel_group())
+                    val = rebalance_pad_2d_tensor(val, group=mcore_parallel_state.get_context_parallel_group())
+                    val = rebalance_pad_2d_tensor(val, group=mcore_parallel_state.get_pipeline_model_parallel_group())
 
-                val = rebalance_nd_tensor(val, group=mcore_parallel_state.get_data_parallel_group())
+                val = rebalance_pad_2d_tensor(val, group=mcore_parallel_state.get_data_parallel_group())
                 global_rollout_batch[k] = val
             elif isinstance(val, list) and all(isinstance(x, str) for x in val):
                 # same reshard logic described above
                 if is_trt_llm_reshard():
+                    val = gather_string_list_nccl(val, group=mcore_parallel_state.get_context_parallel_group())
                     val = gather_string_list_nccl(val, group=mcore_parallel_state.get_pipeline_model_parallel_group())
                 val = gather_string_list_nccl(val, mcore_parallel_state.get_data_parallel_group())
                 global_rollout_batch[k] = val
@@ -155,6 +158,38 @@ class ReinforceRolloutBatch(UserDict):
 
         return chunked_rollout_batch
 
+    def token_balanced_split(self, rank, split_size):
+        from collections import defaultdict
+
+        batch_set = set()  # set of batch sizes of values in rollout batch
+        for val in self.data.values():
+            if isinstance(val, torch.Tensor):
+                batch_set.add(val.size(0))
+            else:
+                batch_set.add(len(val))
+        assert len(batch_set) == 1, "batch sizes are not the same across the rollout batch"
+
+        response_lengths = self['response_lengths'].tolist()
+
+        chunk_mapping = [[[],[]] for _ in range(split_size)]
+        tokens_per_rank = [0 for _ in range(split_size)]
+        
+        for idx, response_length in enumerate(response_lengths):
+            min_token_dp_rank = min(range(len(tokens_per_rank)), key=tokens_per_rank.__getitem__)
+            chunk_mapping[min_token_dp_rank][0].append(idx)
+            chunk_mapping[min_token_dp_rank][1].append(response_length)
+            tokens_per_rank[min_token_dp_rank] += response_length
+        chunked_batch = type(self)()
+        sample_indices, response_lengths = chunk_mapping[rank]
+        indices = torch.tensor(sample_indices, dtype=torch.int, device=torch.cuda.current_device())
+
+        for k,v in self.data.items():
+            if torch.is_tensor(v):
+                chunked_batch[k] = torch.index_select(v, dim=0, index=indices).clone()
+            else:
+                chunked_batch[k] = [v[i] for i in indices]
+
+        return chunked_batch
 
 def compute_num_rollout_microbatches(dataloader):
     return divide(
@@ -280,6 +315,7 @@ class ReinforceTrainer:
         reinforce_rollout_data["response_tokens"] = response_tokens
         reinforce_rollout_data["is_end"] = is_end
         reinforce_rollout_data["prompt_mask"] = rollout_batch["prompt_mask"]
+        reinforce_rollout_data["response_lengths"] = response_lengths
 
         # compute metrics
         # these are not global yet
@@ -381,18 +417,25 @@ class ReinforceTrainer:
                     sampler_iter, num_microbatches, dataloader.dataset, self.collate_fn
                 )
 
+            b_count = -1
             with self.timer("generate"):
                 for batch in batch_iterator:
+                    b_count += 1
                     if not is_validation:
-                        print(batch["problem"].shape)
+                        dshape = batch["problem"].shape
                         batch = math_batch_repeat(batch, num_repetitions=self.cfg.prompt_rollouts_per_microbatch)
-                        for _ in range(self.cfg.num_rollouts_per_prompt // self.cfg.prompt_rollouts_per_microbatch):
+                        for idx in range(self.cfg.num_rollouts_per_prompt // self.cfg.prompt_rollouts_per_microbatch):
+
+                            tic = time.perf_counter()
                             rollout_batch = self.model.infer(batch)
+                            toc = time.perf_counter()
+                            print(f"{torch.cuda.current_device()} microbatch: {b_count} sample{idx}: self.model.infer took {toc-tic}s")
+
                             rollout_batch["prompt_tokens"] = batch["problem"]
                             rollout_batch["generator_rank"] = (
                                 torch.ones(batch["problem"].shape[0]) * parallel_state.get_model_parallel_src_rank()
                             )
-                            futures.append(self.rm.infer_rm(rollout_batch))
+                            rm_rollout_batches.append(self.rm.infer_rm(rollout_batch))
                             # del rollout_batch["ground_truths"]
                             del rollout_batch["response_sentences"]
                             rollout_batches.append(rollout_batch)
@@ -417,34 +460,30 @@ class ReinforceTrainer:
 
         padded_rollout_sequence_length = global_rollout_batch["response_tokens"].size(-1)
 
-        # the chunking must be outside of the TRT-LLM context because we do logprob calculation in nemo
-        balanced_local_batch = global_rollout_batch.chunk(
+        balanced_local_batch = global_rollout_batch.token_balanced_split(
             rank=parallel_state.get_data_parallel_rank(),
             split_size=parallel_state.get_data_parallel_world_size(),
-            seed=self.step,
         )
         # since we compute the logprobs in nemo we need to disable the resharding
         batched_response_tokens = balanced_local_batch["response_tokens"]
 
         with self.timer("logprobs"):
-            rollout_logprobs = self.model.get_inference_log_probs(batched_response_tokens)
+            rollout_logprobs = self.model.get_inference_log_probs(
+                response_tokens=batched_response_tokens,
+                response_lengths=balanced_local_batch["response_lengths"])
+            
             balanced_local_batch["logprobs"] = rollout_logprobs
 
         compute_init_policy_kl = not is_validation and self.compute_init_policy_kl
         if compute_init_policy_kl:
             with self.timer("init_logprobs"):
-                rollout_init_logprobs = self.model.get_init_policy_logprobs(batched_response_tokens)
+                rollout_init_logprobs = self.model.get_init_policy_logprobs(
+                    batched_response_tokens,
+                    balanced_local_batch["response_lengths"])
                 balanced_local_batch["init_logprobs"] = rollout_init_logprobs
         global_rollout_batch = balanced_local_batch.gather_and_balance_globally()
-
         # we send the request in sharded context, so we need to keep this sharding and then undo it
         with reshard_context():
-            with self.timer("critic_wait"):
-                rm_rollout_batches = []
-                for future in futures:
-                    rewards = future.result().squeeze(1)
-                    rm_rollout_batches.append({"rewards": rewards})
-
             unbalanced_rm_batch = ReinforceRolloutBatch.from_rollout_batches(
                 rm_rollout_batches,
                 eos_id=self.model.tokenizer.eos_id,
@@ -469,20 +508,22 @@ class ReinforceTrainer:
 
         # chunking needs to be outside of reshard region
         # NOTE: the seed here must be the same as the chunk before since we need to shuffle
-        # these values the same way as the other values
-        balanced_rm_batch = global_rm_batch.chunk(
+        global_rollout_batch.update(global_rm_batch)
+        completed_token_balanced_rollout_batch = global_rollout_batch.token_balanced_split(
             rank=parallel_state.get_data_parallel_rank(),
             split_size=parallel_state.get_data_parallel_world_size(),
-            seed=self.step,
         )
-        balanced_local_batch.update(balanced_rm_batch)
 
-        global_rollout_batch.update(global_rm_batch)
-        rank = torch.distributed.get_rank()
-        savefile = f"train_{rank}.jsonl" if not is_validation else f"validation_{rank}.jsonl"
-        self.generation_log(global_rollout_batch, os.path.join(self.cfg.generation_save_dir, savefile))
-
-        return balanced_local_batch, cpu_dict(self.compute_rollout_metrics(global_rollout_batch))
+        for k,v in completed_token_balanced_rollout_batch.items():
+            if torch.is_tensor(v) and len(v.shape)>1:
+                print(f"{torch.cuda.current_device()} {k} {v.shape}")
+            else:
+                print(f"{torch.cuda.current_device()} {k} {v}")
+        
+        # rank = torch.distributed.get_rank()
+        # savefile = f"train_{rank}.jsonl" if not is_validation else f"validation_{rank}.jsonl"
+        # self.generation_log(global_rollout_batch, os.path.join(self.cfg.generation_save_dir, savefile))
+        return completed_token_balanced_rollout_batch, cpu_dict(self.compute_rollout_metrics(global_rollout_batch))
 
     def compute_rollout_metrics(self, rollout_batch):
         table = {}
@@ -571,6 +612,13 @@ class ReinforceTrainer:
 
         reinforce_rollout_data, reinforce_rollout_metrics = self.generate_reinforce_data(rollout_batch)
 
+        for k,v in reinforce_rollout_data.items():
+            if torch.is_tensor(v) and len(v.shape)>1:
+                print(f"{torch.cuda.current_device()} reinforce_rollout_data {k} {v.shape}")
+            else:
+                print(f"{torch.cuda.current_device()} reinforce_rollout_data {k} {v}")
+        torch.distributed.breakpoint()
+
         with self.timer("finish_inference"):
             # Timing includes engine unloading if enabled
             self.model.finish_inference()
@@ -654,32 +702,32 @@ class ReinforceTrainer:
                 timing_metrics = {}
 
                 clear_memory()
-                print("rollouts start")
+                print(f"{torch.cuda.current_device()} rollouts start")
                 with self.timer("rollout_time"):
                     reinforce_rollout_data, metrics, rollout_timer_metrics = self.generate_rollouts()
-                print("rollouts done")
-                print("metrics start")
+                print(f"{torch.cuda.current_device()} rollouts done")
+                # print("metrics start")
                 # Consume rollout_time
-                timing_metrics.update(self.timer.consume_durations())
+                # timing_metrics.update(self.timer.consume_durations())
 
-                rollout_timer_metrics = all_reduce_dict(rollout_timer_metrics, op=torch.distributed.ReduceOp.MAX)
-                timing_metrics.update(rollout_timer_metrics)
+                # rollout_timer_metrics = all_reduce_dict(rollout_timer_metrics, op=torch.distributed.ReduceOp.MAX)
+                # timing_metrics.update(rollout_timer_metrics)
 
                 # logging
-                table_metrics = metrics.pop("table")
-                self.train_df.loc[len(self.train_df)] = [
-                    self.step,
-                    table_metrics["prompt"],
-                    table_metrics["response"],
-                    table_metrics["reward"],
-                ]
-                metrics["epoch"] = self.epoch + 1
-                self.logger.log_metrics(
-                    metrics, step=self.step, prefix="train_rollouts/",
-                )
-                self.logger.log_table(
-                    key="table/train_rollouts", dataframe=self.train_df, step=self.step,
-                )
+                # table_metrics = metrics.pop("table")
+                # self.train_df.loc[len(self.train_df)] = [
+                #     self.step,
+                #     table_metrics["prompt"],
+                #     table_metrics["response"],
+                #     table_metrics["reward"],
+                # ]
+                # metrics["epoch"] = self.epoch + 1
+                # self.logger.log_metrics(
+                #     metrics, step=self.step, prefix="train_rollouts/",
+                # )
+                # self.logger.log_table(
+                #     key="table/train_rollouts", dataframe=self.train_df, step=self.step,
+                # )
 
                 rollout_size = reinforce_rollout_data["response_tokens"].size(0)
                 print("batch_calc info", rollout_size, num_to_load_on_each_dp, self.cfg.model_gbs, dp_size)
@@ -687,20 +735,20 @@ class ReinforceTrainer:
                     reinforce_rollout_data, divide(rollout_size, num_to_load_on_each_dp)
                 )
                 print("metrics done")
-                print("train start")
+                print(f"{torch.cuda.current_device()} train start")
                 # start training
                 clear_memory()
                 with self.timer("train_time"):
                     self.run_training(rollout_dataloader_iter)
                 print("train done")
-                print("logger start")
+                # print("logger start")
 
-                self.logger.log_metrics(
-                    timing_metrics | self.timer.consume_durations(), step=self.step, prefix="timers/"
-                )
+                # self.logger.log_metrics(
+                #     timing_metrics | self.timer.consume_durations(), step=self.step, prefix="timers/"
+                # )
 
                 self.step += 1
-                print("logger done")
+                # print("logger done")
                 print("val/ckpt check/start")
 
                 run_time_exceeded = self.run_timer.is_finished()
@@ -713,36 +761,36 @@ class ReinforceTrainer:
                     run_time_exceeded=run_time_exceeded,
                 )
 
-                if run_val:
-                    with self.timer("validation_time"):
-                        val_metrics = self.run_validation()
-                    # Note: validation_time is logged one step behind (val step 5 means we've completed step 4)
-                    timing_metrics.update(self.timer.consume_durations())
+                # if run_val:
+                #     with self.timer("validation_time"):
+                #         val_metrics = self.run_validation()
+                #     # Note: validation_time is logged one step behind (val step 5 means we've completed step 4)
+                #     timing_metrics.update(self.timer.consume_durations())
 
-                    val_table_metrics = val_metrics.pop("table")
+                #     val_table_metrics = val_metrics.pop("table")
 
-                    self.val_df.loc[len(self.val_df)] = [
-                        self.step,
-                        val_table_metrics["prompt"],
-                        val_table_metrics["response"],
-                        val_table_metrics["reward"],
-                    ]
-                    self.logger.log_metrics(val_metrics, step=self.step, prefix="val_rollouts/")
-                    self.logger.log_table("table/val_rollouts", dataframe=self.val_df, step=self.step)
+                #     self.val_df.loc[len(self.val_df)] = [
+                #         self.step,
+                #         val_table_metrics["prompt"],
+                #         val_table_metrics["response"],
+                #         val_table_metrics["reward"],
+                #     ]
+                #     self.logger.log_metrics(val_metrics, step=self.step, prefix="val_rollouts/")
+                #     self.logger.log_table("table/val_rollouts", dataframe=self.val_df, step=self.step)
 
-                    step_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
+                #     step_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
 
-                step_metrics.update(timing_metrics)
-                step_metrics.update({f"train_{k}": v for k, v in metrics.items()})
-                global_pbar.set_postfix(step_metrics)
+                # step_metrics.update(timing_metrics)
+                # step_metrics.update({f"train_{k}": v for k, v in metrics.items()})
+                # global_pbar.set_postfix(step_metrics)
 
-                if save_model:
-                    step_metrics = {k: torch.as_tensor(v) for k, v in step_metrics.items()}
-                    self.save(step_metrics, is_train_end=is_train_end)
+                # if save_model:
+                #     step_metrics = {k: torch.as_tensor(v) for k, v in step_metrics.items()}
+                #     self.save(step_metrics, is_train_end=is_train_end)
 
-                if run_time_exceeded:
-                    logging.info(f"Time limit given by run_timer={self.run_timer} reached. Stopping run")
-                    return
+                # if run_time_exceeded:
+                #     logging.info(f"Time limit given by run_timer={self.run_timer} reached. Stopping run")
+                #     return
                 print("val/ckpt check/start done")
 
         self.logger.finalize()

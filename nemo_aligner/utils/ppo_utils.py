@@ -17,6 +17,7 @@
 import operator
 
 import torch
+import torch.distributed
 
 from nemo_aligner.utils.utils import masked_mean
 
@@ -245,6 +246,7 @@ def calculate_rloo_baseline(prompts, reward, mask):
             # Ignore sample: set baseline equal to reward
             baseline[prompt_idx] = reward[prompt_idx]
         else:
+            rloo_mat = rloo_mat.to(torch.double)
             rloo = torch.matmul(rloo_mat, reward[prompt_idx] * mask[prompt_idx]) / (mask[prompt_idx].sum() - 1)
             baseline[prompt_idx] = rloo
 

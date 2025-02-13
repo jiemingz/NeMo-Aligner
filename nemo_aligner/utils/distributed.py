@@ -37,11 +37,35 @@ from nemo_aligner.utils.ppo_utils import calculate_entropy
 from nemo_aligner.utils.utils import deprecated_in_version
 
 
+def rebalance_pad_2d_tensor(tensor, group):
+    world_size = torch.distributed.get_world_size(group)
+    if world_size == 1:
+        return tensor
+
+    if len(tensor.shape) == 1:
+        return rebalance_nd_tensor(tensor, group)
+
+    assert len(tensor.shape) == 2
+
+    # Prepare a list for gathering shapes from all ranks.
+    gathered_shapes = [torch.zeros(2, device=torch.cuda.current_device(), dtype=torch.int) for _ in range(world_size)]
+    local_shape = torch.tensor(tensor.shape, device=torch.cuda.current_device(), dtype=torch.int)
+    torch.distributed.all_gather(gathered_shapes, local_shape, group=group)
+    shapes = [s.cpu().tolist() for s in gathered_shapes]
+
+    max_seqlen = max(s[1] for s in shapes)
+    seq_pad_amount = max_seqlen - tensor.shape[1]
+    if seq_pad_amount > 0:
+        padded_tensor = torch.nn.functional.pad(tensor, (0, seq_pad_amount), mode='constant', value=-1)
+    else:
+        padded_tensor = tensor
+
+    return rebalance_nd_tensor(padded_tensor, group)
+
 def rebalance_nd_tensor(tensor, group):
     """
     Takes tensors with variable leading sizes (at dim=0) and then stack them into a single tensor.
     
-    NOTE: assumes all other (i.e., non-zero) dimensions are equal.
     """
     num_samples = torch.as_tensor(tensor.size(0), dtype=torch.int64, device=torch.cuda.current_device())
     batch_num_per_rank = torch.zeros(
@@ -137,7 +161,7 @@ def gather_string_list_nccl(local_string_list, group=None):
     return global_strings
 
 
-@deprecated_in_version("0.7.0", "Please use broadcast_tensor(tensor, src, group, dtype)")
+# @deprecated_in_version("0.7.0", "Please use broadcast_tensor(tensor, src, group, dtype)")
 def broadcast_2d_tensor(tensor, src, group, dtype=torch.float32):
     """Broadcast any 2d tensor from the src rank to every other rank in the given group.
     All the ranks that send or receive data must call this function."""

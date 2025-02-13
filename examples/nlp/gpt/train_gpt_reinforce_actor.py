@@ -28,7 +28,7 @@ from nemo_aligner.data.nlp.builders import (
     build_train_valid_test_math_datasets,
     math_collate_with_pad_to_max_batch,
 )
-from nemo_aligner.models.nlp.gpt.grader_client import RemoteGraderClient
+from nemo_aligner.models.nlp.gpt.grader_client import RemoteGraderClient, GraderClient
 from nemo_aligner.models.nlp.gpt.megatron_gpt_reinforce_math_actor import MegatronGPTReinforceActorModel
 from nemo_aligner.utils import parallel_state
 from nemo_aligner.utils.batch_iterators import get_batch_iterator_cls
@@ -65,7 +65,7 @@ def main(cfg) -> None:
     trainer = resolve_and_create_trainer(cfg, "reinforce")
 
     print("PTL TRAINER BUILT")
-    exp_manager(trainer, cfg.exp_manager)
+    # exp_manager(trainer, cfg.exp_manager)
 
     logger = CustomLoggerWrapper(trainer.loggers)
 
@@ -171,7 +171,7 @@ def main(cfg) -> None:
     logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     print("OPTIM EXTRACTED")
-    rm = RemoteGraderClient(cfg.remote_rm)
+    rm = GraderClient()
     timer = Timer(cfg.exp_manager.get("max_time_per_run") if cfg.exp_manager else None)
 
     batch_iterator_cfg = cfg.trainer.reinforce.get("batch_iterator", {})
