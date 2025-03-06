@@ -258,15 +258,15 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
 
         clear_memory()
 
-        log_memory("before offload parameters")
-        self.maybe_offload_parameters("Temporarily offload model weights for the shared inference backend to save memory")
-        clear_memory()
-        log_memory("after offload parameters")
+        # log_memory("before offload parameters")
+        # self.maybe_offload_parameters("Temporarily offload model weights for the shared inference backend to save memory")
+        # clear_memory()
+        # log_memory("after offload parameters")
 
-        log_memory("before init grad buffer")
-        self._optimizer._init_grad_buffer()
-        clear_memory()
-        log_memory("after init grad buffer")
+        # log_memory("before init grad buffer")
+        # self._optimizer.zero_grad()
+        # clear_memory()
+        # log_memory("after init grad buffer")
 
         log_memory("before onload parameters")
         self.maybe_onload_parameters()
@@ -382,14 +382,7 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
 
         return logprobs
 
-    def prepare_for_inference(self):
-        """normally we would configure the micro batch calculator here
-            but the nemo generation already does the configuration"""
-        self._reset_activation_checkpointing_args()
-        self._reset_sequence_parallelism_args()
-        set_eval(self)
-        self.offload_adam_states()
-        
+    def _convert_model_for_inference_backend(self):
         # testing sync and save to cpu ramdisk
         start_time = time.time()
         out_dir = self.cfg.grpo.share_dir #"/dev/shm/checkpoint_hf/"
@@ -528,11 +521,8 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
                         del param
                     if 'hf_mapping' in locals():
                         del hf_mapping
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
                 print(f"Time taken to convert {gk} {time.time() - ptime}", flush=True)
-            gc.collect()
-            torch.cuda.empty_cache()
+
             print("Finished parameter-by-parameter gathering over PP with conversion mapping.", flush=True)
             print(f"Checksum: {checksum}", flush=True)
         
@@ -576,12 +566,21 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
                     communicable_metadata=recv_metadata[0]
                 )
 
-        torch.distributed.barrier()
-        print(f"MP group: {parallel_state.get_model_parallel_group()}", flush=True)
-        torch.distributed.barrier()
         print(f'TIME TO SAVE {time.time() - start_time}', flush=True)
+        
+    def prepare_for_inference(self):
+        """normally we would configure the micro batch calculator here
+            but the nemo generation already does the configuration"""
+        self._reset_activation_checkpointing_args()
+        self._reset_sequence_parallelism_args()
+        set_eval(self)
+        self.offload_adam_states()
 
         if self.inference_backend:
+            self._convert_model_for_inference_backend()
+            self.maybe_offload_parameters("prepare_for_inference")
+            torch.cuda.synchronize()
+
             # Refitting or recompiling the inference model for generation
             print(f"Memory free before clear before refit {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB", flush=True)
             print(f"reserved before clear before refit {torch.cuda.memory_reserved() / 1024**3:.2f} GB", flush=True)
@@ -590,6 +589,7 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
             print(f"Memory free after clear before refit {torch.cuda.mem_get_info()[0] / 1024**3:.2f} GB", flush=True)  
             print(f"reserved after clear before refit {torch.cuda.memory_reserved() / 1024**3:.2f} GB", flush=True)
             print(f"allocated after clear before refit {torch.cuda.memory_allocated() / 1024**3:.2f} GB", flush=True)
+                        
             if self.cfg.grpo.inference_backend.type == "vllm":
                 self.inference_backend.refit(self.shared_cpu_state_dict)
             else:
@@ -614,7 +614,6 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
         )
 
         if self.inference_backend:
-            self.maybe_offload_parameters("Temporarily offload model weights for the shared inference backend to save memory")
             actor_output = self.inference_backend.generate(inputs, use_greedy=use_greedy)
             response_tokens = actor_output["response_tokens"]
             response_lengths = actor_output["response_lengths"]
@@ -724,11 +723,15 @@ class MegatronGPTActorModel(NLPAdapterModelMixin, MegatronGPTModel, AlignableGen
             # offload onto cpu
             self.distributed_adam_offload_manager.__enter__()
 
-            for k,v in self._optimizer._grad_buffers.items():
-                v.data = v.data.cpu()
-            
+            #clear the weight grads
             self._optimizer._grad_buffers.clear()
-            self._optimizer._grad_buffers.clear()
+            self._optimizer._grads_buckets.clear()
+
+            for param in self.parameters():
+                if hasattr(param, "main_grad"):
+                    param.main_grad = None
+                    param.grad = None
+
             self._optimizer._params_buckets.clear()
             self._optimizer._param_buffers.clear()
             clear_memory()
